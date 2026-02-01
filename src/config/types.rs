@@ -249,6 +249,12 @@ pub enum PolicyConfig {
     ConsistentHash {
         /// Number of virtual nodes per worker for better distribution
         virtual_nodes: u32,
+        /// Maximum length of request text to use for hash key generation (in characters).
+        /// If None or 0, uses the entire request text. If set, only the first N characters
+        /// are used for computing the hash key. This can improve cache locality for
+        /// long prompts while maintaining consistent routing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hash_key_max_length: Option<usize>,
     },
 }
 
@@ -423,8 +429,8 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 32768,
-            queue_size: 100,
-            queue_timeout_secs: 60,
+            queue_size: 10000,
+            queue_timeout_secs: 1800,
             rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
@@ -1000,8 +1006,8 @@ mod tests {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
+            queue_size: 10000,
+            queue_timeout_secs: 1800,
             rate_limit_tokens_per_second: None,
             connection_mode: ConnectionMode::Http,
             model_path: None,
@@ -1066,8 +1072,8 @@ mod tests {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
+            queue_size: 10000,
+            queue_timeout_secs: 1800,
             rate_limit_tokens_per_second: None,
             connection_mode: ConnectionMode::Http,
             model_path: None,
@@ -1128,8 +1134,8 @@ mod tests {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
+            queue_size: 10000,
+            queue_timeout_secs: 1800,
             rate_limit_tokens_per_second: None,
             connection_mode: ConnectionMode::Http,
             model_path: None,

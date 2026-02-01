@@ -295,8 +295,8 @@ impl Router {
         health_check_endpoint = String::from("/health"),
         // IGW defaults
         enable_igw = false,
-        queue_size = 100,
-        queue_timeout_secs = 60,
+        queue_size = 10000,  // Large queue for handling bursts
+        queue_timeout_secs = 1800,  // 30 minutes for long-running requests
         rate_limit_tokens_per_second = None,
         // Tokenizer defaults
         model_path = None,

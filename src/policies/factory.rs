@@ -33,10 +33,8 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
-            PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
-                // Note: virtual_nodes parameter is available but not currently used
-                // The consistent hash policy uses a hardcoded value for now
-                Arc::new(ConsistentHashPolicy::new())
+            PolicyConfig::ConsistentHash { hash_key_max_length, .. } => {
+                Arc::new(ConsistentHashPolicy::with_hash_key_max_length(*hash_key_max_length))
             }
         }
     }
@@ -85,8 +83,10 @@ mod tests {
         assert_eq!(policy.name(), "cache_aware");
 
         // Test ConsistentHash
-        let policy =
-            PolicyFactory::create_from_config(&PolicyConfig::ConsistentHash { virtual_nodes: 160 });
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHash {
+            virtual_nodes: 160,
+            hash_key_max_length: Some(1000),
+        });
         assert_eq!(policy.name(), "consistent_hash");
     }
 

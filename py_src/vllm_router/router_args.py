@@ -23,7 +23,7 @@ class RouterArgs:
     decode_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Routing policy
-    policy: str = "cache_aware"
+    policy: str = "consistent_hash"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
     worker_startup_timeout_secs: int = 600

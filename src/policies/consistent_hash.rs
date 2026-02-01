@@ -29,6 +29,9 @@ pub struct ConsistentHashPolicy {
     hash_ring: RwLock<BTreeMap<u64, String>>,
     /// Current set of workers (for detecting changes)
     current_workers: RwLock<Vec<String>>,
+    /// Maximum length of request text to use for hash key (in characters).
+    /// None or 0 means use entire text.
+    hash_key_max_length: Option<usize>,
 }
 
 impl ConsistentHashPolicy {
@@ -36,6 +39,16 @@ impl ConsistentHashPolicy {
         Self {
             hash_ring: RwLock::new(BTreeMap::new()),
             current_workers: RwLock::new(Vec::new()),
+            hash_key_max_length: None,
+        }
+    }
+
+    /// Create a new consistent hash policy with configurable hash key max length
+    pub fn with_hash_key_max_length(hash_key_max_length: Option<usize>) -> Self {
+        Self {
+            hash_ring: RwLock::new(BTreeMap::new()),
+            current_workers: RwLock::new(Vec::new()),
+            hash_key_max_length,
         }
     }
 
@@ -328,7 +341,7 @@ impl ConsistentHashPolicy {
         for header_name in Self::SESSION_HEADER_NAMES {
             if let Some(value) = headers.get(*header_name) {
                 if !value.is_empty() {
-                    info!(
+                    debug!(
                         "CONSISTENT_HASH_DEBUG: Found session key in header '{}': {}",
                         header_name, value
                     );
@@ -351,7 +364,7 @@ impl ConsistentHashPolicy {
         if let Some(session_id) =
             self.extract_nested_field_value(text, "session_params", "session_id")
         {
-            info!(
+            debug!(
                 "CONSISTENT_HASH_DEBUG: Found session_params.session_id: {}",
                 session_id
             );
@@ -360,7 +373,7 @@ impl ConsistentHashPolicy {
 
         // 2. Try to extract direct user field (from OpenAI ChatCompletion/Completion requests)
         if let Some(user) = self.extract_field_value(text, "user") {
-            info!("CONSISTENT_HASH_DEBUG: Found user field: {}", user);
+            debug!("CONSISTENT_HASH_DEBUG: Found user field: {}", user);
             return Some(format!("user:{}", user));
         }
 
@@ -405,10 +418,23 @@ impl ConsistentHashPolicy {
 
         // 3. Final fallback: hash of request body
         let text = request_text.unwrap_or("");
-        if text.len() > 100 {
-            format!("request_hash:{:016x}", Self::fbi_hash(text))
+
+        // Apply hash_key_max_length if configured
+        let text_to_hash = if let Some(max_len) = self.hash_key_max_length {
+            if max_len > 0 && text.len() > max_len {
+                // Truncate to max_len characters (char boundary safe)
+                text.chars().take(max_len).collect::<String>()
+            } else {
+                text.to_string()
+            }
         } else {
-            format!("request:{}", text)
+            text.to_string()
+        };
+
+        if text_to_hash.len() > 100 {
+            format!("request_hash:{:016x}", Self::fbi_hash(&text_to_hash))
+        } else {
+            format!("request:{}", text_to_hash)
         }
     }
 
@@ -590,12 +616,12 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                 hdrs.keys().collect::<Vec<_>>()
             );
         }
-        info!("CONSISTENT_HASH_DEBUG: Extracted hash key: {}", hash_key);
+        debug!("CONSISTENT_HASH_DEBUG: Extracted hash key: {}", hash_key);
 
         // Find target worker using consistent hashing
         let target_worker_url = match self.find_worker_by_hash(&hash_key) {
             Some(url) => {
-                info!(
+                debug!(
                     "CONSISTENT_HASH_DEBUG: Hash key '{}' mapped to worker: {}",
                     hash_key, url
                 );
@@ -605,7 +631,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                 // Fallback to first healthy worker if hash ring is empty
                 let fallback_idx = healthy_indices[0];
                 let worker_url = workers[fallback_idx].url();
-                info!(
+                debug!(
                     "CONSISTENT_HASH_DEBUG: Hash ring empty, falling back to worker: {}",
                     worker_url
                 );
@@ -644,7 +670,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                         "CONSISTENT_HASH_DEBUG: Selected worker at index {}: {}",
                         idx, worker_url
                     );
-                    info!(
+                    debug!(
                         "Consistent hash routing: key='{}' -> worker='{}' (index={})",
                         hash_key, worker_url, idx
                     );

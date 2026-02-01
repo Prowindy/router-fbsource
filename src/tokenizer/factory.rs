@@ -158,24 +158,45 @@ pub async fn create_tokenizer_async(
     // Try to download tokenizer files from HuggingFace
     match download_tokenizer_from_hf(model_name_or_path).await {
         Ok(cache_dir) => {
-            // Look for tokenizer.json in the cache directory
-            let tokenizer_path = cache_dir.join("tokenizer.json");
-            if tokenizer_path.exists() {
-                create_tokenizer_from_file(tokenizer_path.to_str().unwrap())
-            } else {
-                // Try other common tokenizer file names
-                let possible_files = ["tokenizer_config.json", "vocab.json"];
-                for file_name in &possible_files {
-                    let file_path = cache_dir.join(file_name);
-                    if file_path.exists() {
-                        return create_tokenizer_from_file(file_path.to_str().unwrap());
-                    }
+            // First, try to load the entire directory as a HuggingFace tokenizer
+            // This works even if the tokenizer uses SentencePiece as the backend
+            if let Some(dir_str) = cache_dir.to_str() {
+                eprintln!("Attempting to load tokenizer from directory: {}", dir_str);
+                if let Ok(tokenizer) = create_tokenizer_from_file(dir_str) {
+                    eprintln!("Successfully loaded tokenizer from directory");
+                    return Ok(tokenizer);
                 }
-                Err(Error::msg(format!(
-                    "Downloaded model '{}' but couldn't find a suitable tokenizer file",
-                    model_name_or_path
-                )))
             }
+
+            // If directory loading failed, try individual files
+            let possible_files = [
+                "tokenizer.json",           // Standard HF fast tokenizer
+                "tokenizer_config.json",    // Config file (for slow tokenizer)
+                "vocab.json",               // Vocabulary file
+            ];
+
+            for file_name in &possible_files {
+                let file_path = cache_dir.join(file_name);
+                if file_path.exists() {
+                    eprintln!("Found tokenizer file: {}", file_path.display());
+                    return create_tokenizer_from_file(file_path.to_str().unwrap());
+                }
+            }
+
+            // If no standard files found, list what we have for debugging
+            eprintln!("No standard tokenizer files found. Files in cache:");
+            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                for entry in entries.flatten() {
+                    eprintln!("  - {}", entry.file_name().to_string_lossy());
+                }
+            }
+
+            Err(Error::msg(format!(
+                "Downloaded model '{}' but couldn't find a suitable tokenizer file. \
+                 Expected one of: {}",
+                model_name_or_path,
+                possible_files.join(", ")
+            )))
         }
         Err(e) => Err(Error::msg(format!(
             "Failed to download tokenizer from HuggingFace: {}",

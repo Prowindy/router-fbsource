@@ -42,7 +42,7 @@ use tracing::{error, info, warn, Level};
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
-    pub rate_limiter: Arc<TokenBucket>,
+    pub rate_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -57,8 +57,13 @@ impl AppContext {
         max_concurrent_requests: usize,
         rate_limit_tokens_per_second: Option<usize>,
     ) -> Result<Self, String> {
-        let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
-        let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+        // Only create rate limiter if max_concurrent_requests > 0
+        let rate_limiter = if max_concurrent_requests > 0 {
+            let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
+            Some(Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens)))
+        } else {
+            None
+        };
 
         // Initialize gRPC-specific components only when in gRPC mode
         let tokenizer = if router_config.connection_mode == ConnectionMode::Grpc {
@@ -681,13 +686,29 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
+    // Log concurrency control configuration
+    if let Some(ref bucket) = app_context.rate_limiter {
+        info!(
+            "Rate limiting ENABLED: max_concurrent_requests={}, rate_limit_tokens_per_second={:?}",
+            config.router_config.max_concurrent_requests,
+            config.router_config.rate_limit_tokens_per_second
+        );
+    } else {
+        info!(
+            "Rate limiting DISABLED: max_concurrent_requests={}",
+            config.router_config.max_concurrent_requests
+        );
+    }
+
     // Start queue processor if enabled
     if let Some(processor) = processor {
         tokio::spawn(processor.run());
         info!(
-            "Started request queue with size: {}, timeout: {}s",
+            "Request queue ENABLED: queue_size={}, timeout={}s",
             config.router_config.queue_size, config.router_config.queue_timeout_secs
         );
+    } else if app_context.rate_limiter.is_some() {
+        info!("Request queue DISABLED (queue_size=0)");
     }
 
     // Create app state with router and context

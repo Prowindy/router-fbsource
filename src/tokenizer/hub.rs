@@ -100,7 +100,27 @@ pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::R
         match repo.get(&sib.rfilename).await {
             Ok(path) => {
                 if cache_dir.is_none() {
-                    cache_dir = path.parent().map(|p| p.to_path_buf());
+                    // For files in subdirectories (e.g., original/tokenizer.model),
+                    // we want the snapshot root, not the subdirectory
+                    // The HF cache structure is: .../snapshots/<hash>/<file>
+                    // We need to get to the snapshot/<hash> directory
+                    let mut parent = path.parent();
+                    while let Some(p) = parent {
+                        if p.file_name().and_then(|n| n.to_str()) == Some("snapshots") {
+                            // Found the snapshots dir, use the next level down
+                            if let Some(snapshot_dir) = path.ancestors().find(|a| {
+                                a.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("snapshots")
+                            }) {
+                                cache_dir = Some(snapshot_dir.to_path_buf());
+                            }
+                            break;
+                        }
+                        parent = p.parent();
+                    }
+                    // Fallback: if we can't find snapshots dir, use parent of file
+                    if cache_dir.is_none() {
+                        cache_dir = path.parent().map(|p| p.to_path_buf());
+                    }
                 }
                 tokenizer_files_found = true;
             }

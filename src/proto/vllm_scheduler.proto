@@ -117,8 +117,8 @@ message GenerateRequest {
   // LoRA adapter ID (if pre-loaded)
   string lora_id = 15;
 
-  // Data parallel routing
-  int32 data_parallel_rank = 16;
+  // Data parallel routing (optional - if not set, engine chooses automatically)
+  optional int32 data_parallel_rank = 16;
 
   // For load balancing
   int32 dp_balance_id = 17;

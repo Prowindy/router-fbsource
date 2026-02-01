@@ -384,6 +384,7 @@ impl CliArgs {
             },
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
+                hash_key_max_length: Some(100), // Default to 100 characters
             },
             _ => PolicyConfig::RoundRobin, // Fallback
         }
@@ -563,8 +564,8 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             max_concurrent_requests: self.max_concurrent_requests,
-            queue_size: 100,        // Default queue size
-            queue_timeout_secs: 60, // Default timeout
+            queue_size: 10000,      // Large queue for handling bursts
+            queue_timeout_secs: 1800, // Default timeout (30 minutes for long-running requests)
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: RetryConfig {
                 max_retries: self.retry_max_retries,

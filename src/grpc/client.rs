@@ -4,21 +4,32 @@ use tracing::debug;
 
 // Include the generated protobuf code
 pub mod proto {
-    tonic::include_proto!("vllm.grpc.scheduler");
+    tonic::include_proto!("vllm.grpc.engine");
 }
 
 // The generated module structure depends on the package name in the .proto file
-// package vllm.grpc.scheduler; generates a nested module structure
+// package vllm.grpc.engine; generates a nested module structure
 
-/// gRPC client for VLLM scheduler
+// High-performance network tuning constants
+// These values are tuned for LLM inference workloads with streaming responses
+const RPC_TIMEOUT_SECS: u64 = 300;  // 5 minutes timeout for long-running requests
+const CONNECTION_HEALTH_PROBE_INTERVAL_SECS: u64 = 25;
+const CONNECTION_HEALTH_TIMEOUT_SECS: u64 = 12;
+const TCP_PROBE_INTERVAL_SECS: u64 = 55;
+// HTTP/2 flow control: Large buffers for streaming token generation
+const STREAM_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 16MB per stream
+const CONNECTION_BUFFER_SIZE: u32 = 32 * 1024 * 1024; // 32MB per connection
+
+/// gRPC client for VLLM engine
+#[derive(Clone)]
 pub struct VllmSchedulerClient {
-    client: proto::vllm_scheduler_client::VllmSchedulerClient<Channel>,
+    client: proto::vllm_engine_client::VllmEngineClient<Channel>,
 }
 
 impl VllmSchedulerClient {
     /// Create a new client and connect to the scheduler
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        debug!("Connecting to VLLM scheduler at {}", endpoint);
+        debug!("Connecting to VLLM engine at {}", endpoint);
 
         // Convert grpc:// to http:// for tonic
         let http_endpoint = if endpoint.starts_with("grpc://") {
@@ -27,14 +38,48 @@ impl VllmSchedulerClient {
             endpoint.to_string()
         };
 
-        let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(30))
+        let channel = Self::build_optimized_channel(&http_endpoint).await?;
+        let client = proto::vllm_engine_client::VllmEngineClient::new(channel);
+
+        Ok(Self { client })
+    }
+
+    /// Build a high-performance gRPC channel with production-grade tuning.
+    /// Optimizations include:
+    /// - Disabled Nagle's algorithm for low-latency streaming
+    /// - Dynamic HTTP/2 flow control windows
+    /// - Connection health probes for early failure detection
+    /// - Large buffers optimized for LLM token streaming workloads
+    async fn build_optimized_channel(
+        endpoint: &str,
+    ) -> Result<Channel, Box<dyn std::error::Error>> {
+        let channel = Channel::from_shared(endpoint.to_string())?
+            // RPC timeout for long-running generation requests
+            .timeout(Duration::from_secs(RPC_TIMEOUT_SECS))
+            // Disable Nagle's algorithm to avoid batching delays on small packets
+            // Critical for streaming token-by-token responses
+            .tcp_nodelay(true)
+            // Enable dynamic HTTP/2 window sizing to prevent backpressure
+            // during high-throughput streaming
+            .http2_adaptive_window(true)
+            // Set generous buffer sizes for streaming LLM responses
+            // Prevents flow control stalls during token generation bursts
+            .initial_stream_window_size(Some(STREAM_BUFFER_SIZE))
+            .initial_connection_window_size(Some(CONNECTION_BUFFER_SIZE))
+            // Connection health monitoring
+            // Sends periodic pings to detect broken connections early
+            .http2_keep_alive_interval(Duration::from_secs(CONNECTION_HEALTH_PROBE_INTERVAL_SECS))
+            .keep_alive_timeout(Duration::from_secs(CONNECTION_HEALTH_TIMEOUT_SECS))
+            // Keep connection alive even when no active streams
+            // Avoids reconnection overhead for subsequent requests
+            .keep_alive_while_idle(true)
+            // TCP-level keepalive as defense in depth
+            // Complements HTTP/2 keepalive for detecting network issues
+            .tcp_keepalive(Some(Duration::from_secs(TCP_PROBE_INTERVAL_SECS)))
             .connect()
             .await?;
 
-        let client = proto::vllm_scheduler_client::VllmSchedulerClient::new(channel);
-
-        Ok(Self { client })
+        Ok(channel)
     }
 
     /// Submit a generation request (returns streaming response)
@@ -47,17 +92,62 @@ impl VllmSchedulerClient {
         Ok(response.into_inner())
     }
 
+    /// Submit a generation request and return an auto-cleanup stream wrapper
+    ///
+    /// The returned stream automatically sends an abort request when dropped,
+    /// ensuring proper cleanup even if the HTTP client disconnects or an error occurs.
+    /// Call `mark_completed()` on the stream after successful completion to prevent
+    /// unnecessary abort RPCs.
+    ///
+    /// This is the preferred method for creating streams in production code.
+    pub async fn generate(
+        &self,
+        req: proto::GenerateRequest,
+    ) -> Result<crate::routers::grpc::auto_cleanup_stream::AutoCleanupStream, Box<dyn std::error::Error>> {
+        let request_id = req.request_id.clone();
+        let mut client = self.client.clone();
+        let request = Request::new(req);
+
+        let response = client.generate(request).await?;
+
+        Ok(crate::routers::grpc::auto_cleanup_stream::AutoCleanupStream::new(
+            response.into_inner(),
+            request_id,
+            self.clone(),
+        ))
+    }
+
+    /// Submit a generation request and return a StreamGuard wrapper
+    ///
+    /// This method wraps the stream in a StreamGuard that automatically sends
+    /// an abort RPC when dropped before completion. This ensures proper cleanup
+    /// and prevents wasted GPU computation.
+    ///
+    /// The caller should call `mark_completed()` on the returned StreamGuard
+    /// when the stream completes successfully to prevent unnecessary abort RPCs.
+    ///
+    /// DEPRECATED: Use `generate()` instead which returns AutoCleanupStream
+    pub async fn generate_with_guard(
+        &mut self,
+        req: proto::GenerateRequest,
+    ) -> Result<crate::routers::grpc::stream_guard::StreamGuard, Box<dyn std::error::Error>> {
+        let request_id = req.request_id.clone();
+        let stream = self.generate_stream(req).await?;
+
+        Ok(crate::routers::grpc::stream_guard::StreamGuard::new(
+            stream,
+            request_id,
+            self.clone(),
+        ))
+    }
+
     /// Perform health check
     pub async fn health_check(
         &mut self,
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
         debug!("Sending health check request");
-        let request = Request::new(proto::HealthCheckRequest {
-            tokenized: Some(proto::TokenizedInput {
-                original_text: "Hello".to_string(),
-                input_ids: vec![9906], // Mock token ID for "Hello"
-            }),
-        });
+        // HealthCheckRequest should be empty to match vLLM engine proto
+        let request = Request::new(proto::HealthCheckRequest {});
 
         let response = self.client.health_check(request).await?;
         debug!("Health check response received");

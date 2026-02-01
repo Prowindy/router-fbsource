@@ -1,9 +1,12 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only regenerate if the proto file changes
-    println!("cargo:rerun-if-changed=src/proto/vllm_scheduler.proto");
+    println!("cargo:rerun-if-changed=src/proto/vllm_engine.proto");
 
     // Configure protobuf compilation with custom settings
-    let config = prost_build::Config::new();
+    let mut config = prost_build::Config::new();
+
+    // Enable proto3 optional support (required for vllm_engine.proto)
+    config.protoc_arg("--experimental_allow_proto3_optional");
 
     // Skip serde for types that use prost_types::Struct
     // These cause conflicts and we don't need serde for all generated types
@@ -15,15 +18,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         // Add a module-level attribute for documentation and clippy warnings
         .server_mod_attribute(
-            "vllm.grpc.scheduler",
+            "vllm.grpc.engine",
             "#[allow(unused, clippy::mixed_attributes_style)]",
         )
         .client_mod_attribute(
-            "vllm.grpc.scheduler",
+            "vllm.grpc.engine",
             "#[allow(unused, clippy::mixed_attributes_style)]",
         )
         // Compile the proto file with the custom config
-        .compile_protos_with_config(config, &["src/proto/vllm_scheduler.proto"], &["src/proto"])?;
+        .compile_protos_with_config(config, &["src/proto/vllm_engine.proto"], &["src/proto"])?;
 
     println!("cargo:warning=Protobuf compilation completed successfully");
 

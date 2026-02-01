@@ -4373,6 +4373,7 @@ name = "vllm_router_rs"
 version = "0.1.9"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum 0.8.6",
  "backoff",
@@ -4386,6 +4387,7 @@ dependencies = [
  "futures-util",
  "hf-hub",
  "http",
+ "http-body",
  "http-body-util",
  "k8s-openapi",
  "kube",

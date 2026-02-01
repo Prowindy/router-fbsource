@@ -1,10 +1,15 @@
 use axum::{
+    body::Body,
     extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
     response::IntoResponse, response::Response,
 };
+use bytes::Bytes;
+use http_body::Frame;
 use rand::Rng;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
@@ -16,6 +21,79 @@ pub use crate::core::token_bucket::TokenBucket;
 
 use crate::metrics::RouterMetrics;
 use crate::server::AppState;
+
+// ============ TokenGuardBody for Streaming ============
+
+/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
+/// This ensures that for streaming responses, the token is only returned after the entire
+/// stream has been sent to the client.
+pub struct TokenGuardBody {
+    inner: Body,
+    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
+    token_bucket: Option<Arc<TokenBucket>>,
+    /// Number of tokens to return.
+    tokens: f64,
+}
+
+impl TokenGuardBody {
+    /// Create a new TokenGuardBody that will return tokens when dropped.
+    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+        Self {
+            inner,
+            token_bucket: Some(token_bucket),
+            tokens,
+        }
+    }
+}
+
+impl Drop for TokenGuardBody {
+    fn drop(&mut self) {
+        if let Some(bucket) = self.token_bucket.take() {
+            let tokens = self.tokens;
+            debug!(
+                "[TOKEN_LIFECYCLE] TokenGuardBody dropped, returning {} tokens to bucket",
+                tokens
+            );
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    bucket.return_tokens(tokens).await;
+                    debug!("[TOKEN_LIFECYCLE] Successfully returned {} tokens to bucket", tokens);
+                });
+            } else {
+                // Runtime not available (e.g., during shutdown)
+                // Tokens will be lost, but this is acceptable during shutdown
+                warn!(
+                    "TokenGuardBody: Cannot return {} tokens - no Tokio runtime available",
+                    tokens
+                );
+            }
+        }
+    }
+}
+
+impl http_body::Body for TokenGuardBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // SAFETY: We never move the inner body, and Body is Unpin
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+// ============ Request ID Middleware ============
 
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
@@ -172,7 +250,7 @@ impl<B> OnRequest<B> for RequestLogger {
         }
 
         // Log the request start
-        debug!(
+        info!(
             target: "vllm_router_rs::request",
             "started processing request"
         );
@@ -199,7 +277,8 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status.as_u16());
-        span.record("latency", format!("{:?}", latency));
+        // Use microseconds as integer to match sgl-model-gateway format
+        span.record("latency", latency.as_micros() as u64);
 
         // Log the response completion
         let _enter = span.enter();
@@ -214,7 +293,7 @@ impl<B> OnResponse<B> for ResponseLogger {
                 "request failed with client error"
             );
         } else {
-            debug!(
+            info!(
                 target: "vllm_router_rs::response",
                 "finished processing request"
             );
@@ -384,22 +463,23 @@ pub struct ConcurrencyLimiter {
 impl ConcurrencyLimiter {
     /// Create new concurrency limiter with optional queue
     pub fn new(
-        token_bucket: Arc<TokenBucket>,
+        token_bucket: Option<Arc<TokenBucket>>,
         queue_size: usize,
         queue_timeout: Duration,
     ) -> (Self, Option<QueueProcessor>) {
-        if queue_size > 0 {
-            let (queue_tx, queue_rx) = mpsc::channel(queue_size);
-            let processor = QueueProcessor::new(token_bucket, queue_rx, queue_timeout);
-
-            (
-                Self {
-                    queue_tx: Some(queue_tx),
-                },
-                Some(processor),
-            )
-        } else {
-            (Self { queue_tx: None }, None)
+        match (token_bucket, queue_size) {
+            (None, _) => (Self { queue_tx: None }, None),
+            (Some(bucket), size) if size > 0 => {
+                let (queue_tx, queue_rx) = mpsc::channel(size);
+                let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
+                (
+                    Self {
+                        queue_tx: Some(queue_tx),
+                    },
+                    Some(processor),
+                )
+            }
+            (Some(_), _) => (Self { queue_tx: None }, None),
         }
     }
 }
@@ -407,25 +487,38 @@ impl ConcurrencyLimiter {
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
-    request: Request<axum::body::Body>,
+    request: Request,
     next: Next,
 ) -> Response {
+    let token_bucket = match &app_state.context.rate_limiter {
+        Some(bucket) => {
+            debug!("Rate limiting enabled, checking token availability");
+            bucket.clone()
+        }
+        None => {
+            // Rate limiting disabled, pass through immediately
+            debug!("Rate limiting disabled, passing through");
+            return next.run(request).await;
+        }
+    };
+
     // Static counter for embeddings queue size
     static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
 
     // Identify if this is an embeddings request based on path
     let is_embeddings = request.uri().path().contains("/v1/embeddings");
-    let token_bucket = app_state.context.rate_limiter.clone();
 
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
         let response = next.run(request).await;
 
-        // Return the token to the bucket
-        token_bucket.return_tokens(1.0).await;
-
-        response
+        // Wrap the response body with TokenGuardBody to return token when stream ends
+        // This ensures that for streaming responses, the token is only returned
+        // after the entire stream has been sent to the client.
+        let (parts, body) = response.into_parts();
+        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
         if let Some(queue_tx) = &app_state.concurrency_queue_tx {
@@ -442,10 +535,9 @@ pub async fn concurrency_limit_middleware(
             // Try to send to queue
             match queue_tx.try_send(queued) {
                 Ok(_) => {
-                    // On successful enqueue, update embeddings queue gauge if applicable
+                    // On successful enqueue, update embeddings queue counter if applicable
                     if is_embeddings {
-                        let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
-                        RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                        EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed);
                     }
 
                     // Wait for token from queue processor
@@ -454,25 +546,21 @@ pub async fn concurrency_limit_middleware(
                             debug!("Acquired token from queue");
                             // Dequeue for embeddings
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
 
                             let response = next.run(request).await;
 
-                            // Return the token to the bucket
-                            token_bucket.return_tokens(1.0).await;
-
-                            response
+                            // Wrap the response body with TokenGuardBody to return token when stream ends
+                            let (parts, body) = response.into_parts();
+                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
                             // Dequeue for embeddings on error
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
                             status.into_response()
                         }
@@ -480,9 +568,7 @@ pub async fn concurrency_limit_middleware(
                             error!("Queue response channel closed");
                             // Dequeue for embeddings on channel error
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }

@@ -201,7 +201,9 @@ impl PolicyRegistry {
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
-            PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
+            PolicyConfig::ConsistentHash { hash_key_max_length, .. } => {
+                Arc::new(ConsistentHashPolicy::with_hash_key_max_length(*hash_key_max_length))
+            }
         }
     }
 
